@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
-//|                    Project100_v1.2_Final.mq5                     |
-//|    VERSION: 1.2 | Hybrid | Strict Step | Custom Telegram         |
+//|                  Project100_v1.3_Final_Fix.mq5                   |
+//|    VERSION: 1.3 | Fix: Constant Input Modification Error         |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.20"
+#property version   "1.30"
 
 #include <Trade\PositionInfo.mqh>
 #include <Trade\Trade.mqh>
@@ -38,9 +38,8 @@ const bool   InpResetOnStart = false;
 const bool   UseTimeFilter   = true;   
 
 // --- VARIABEL GLOBAL ---
-string GV_DD_Money = "P100v12_DD_Money"; 
-string GV_DD_Perc  = "P100v12_DD_Perc";
-// Tidak pakai GV Time lagi karena DD direset tiap hari
+string GV_DD_Money = "P100v13_DD_Money"; 
+string GV_DD_Perc  = "P100v13_DD_Perc";
 
 double buyLotRefPrice = 0;  
 double sellLotRefPrice = 0;
@@ -49,17 +48,44 @@ datetime lastReportTime = 0;
 bool needReset = false;
 int lastDayWIB = -1; 
 
+// Variabel Dinamis
 double ActiveGridGap = 0;
 int    ActiveMagic   = 0;
 string ActiveSymbolName = "";
+double SafeLotAwal = 0.01; // Variabel Penampung Lot (Agar tidak Error)
 
 CPositionInfo positionInfo;
 CTrade trade;
+
+// --- FORWARD DECLARATION (Agar urutan fungsi tidak masalah) ---
+void CheckDailyReset();
+void UpdateDashboard();
+void CheckMaxDrawdown();
+void RemoveDuplicateOrders();
+void SendPeriodicReport();
+void InitBase();
+void ManageGrid(int level);
+void CheckTakeProfit(int currentLevel);
+bool OpenOrder(ENUM_ORDER_TYPE type, int level, double lot);
+void ClosePositions(ENUM_POSITION_TYPE type);
+void CloseAllOrders();
+double GetTotalLots(ENUM_POSITION_TYPE type);
+bool IsOrderExistsById(int level, ENUM_POSITION_TYPE type);
+double CalculateProfit(ENUM_POSITION_TYPE type);
+double CalculateLotByCount(ENUM_POSITION_TYPE type);
+void SendDailyRecap();
+void SendTelegram(string m);
+void CreateLabel(string name, string text, int x, int y, color col, int fontSize=9, bool bold=false);
+datetime GetWIBTime();
+bool IsTradingTime();
 
 //+------------------------------------------------------------------+
 //| 1. FUNGSI INISIALISASI                                           |
 //+------------------------------------------------------------------+
 int OnInit() {
+    // 1. PINDAHKAN NILAI INPUT KE VARIABEL AMAN
+    SafeLotAwal = LotAwal; 
+
     if(ModeTrading == MODE_XAU) {
        ActiveGridGap    = Grid_XAU_Jarak;
        ActiveMagic      = BaseMagic + 1; 
@@ -77,9 +103,9 @@ int OnInit() {
     trade.SetExpertMagicNumber(ActiveMagic);
     trade.SetTypeFillingBySymbol(_Symbol);
     
-    // Safety Lot
+    // Safety Lot (Diaplikasikan ke SafeLotAwal, bukan Input)
     double minVol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-    if(LotAwal < minVol) LotAwal = minVol;
+    if(SafeLotAwal < minVol) SafeLotAwal = minVol;
 
     double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     buyLotRefPrice = price;
@@ -98,10 +124,10 @@ int OnInit() {
 
     UpdateDashboard();
     
-    // 1. KIRIM PESAN START
+    // Kirim Pesan Start
     string wib = TimeToString(GetWIBTime(), TIME_DATE|TIME_MINUTES) + " WIB";
     string msg = "\\\\\\\\\\\\\\\\\\\\\\\\∆/////////////////////\n"
-               + "EA Project100 v1.2 STARTED\n"
+               + "EA Project100 v1.3 STARTED\n"
                + "Mode            : " + ActiveSymbolName + "\n"
                + "time : " + wib;
     SendTelegram(msg);
@@ -150,7 +176,7 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| 4. TIME FILTER (WIB)                                             |
+//| 4. IMPLEMENTASI FUNGSI                                           |
 //+------------------------------------------------------------------+
 datetime GetWIBTime() {
    return TimeGMT() + (7 * 3600);
@@ -169,20 +195,14 @@ bool IsTradingTime() {
    return false;
 }
 
-//+------------------------------------------------------------------+
-//| 5. DAILY RESET & RECAP                                           |
-//+------------------------------------------------------------------+
 void CheckDailyReset() {
    datetime nowWIB = GetWIBTime();
    MqlDateTime dt;
    TimeToStruct(nowWIB, dt);
    if(lastDayWIB != -1 && dt.day != lastDayWIB) {
       SendDailyRecap(); 
-      
-      // RESET DRAWDOWN HARIAN SETELAH LAPORAN
       GlobalVariableSet(GV_DD_Money, 0);
       GlobalVariableSet(GV_DD_Perc, 0);
-      
       lastDayWIB = dt.day; 
       UpdateDashboard(); 
    }
@@ -200,9 +220,8 @@ void SendDailyRecap() {
    
    HistorySelect(0, TimeCurrent()); 
    double dailyProfit = 0;
-   double maxLot24h = 0; // Variabel Max Lot
+   double maxLot24h = 0; 
    
-   // Loop History untuk hitung profit & cari Max Lot kemarin
    for(int i=0; i<HistoryDealsTotal(); i++) {
       ulong ticket = HistoryDealGetTicket(i);
       if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
@@ -213,10 +232,8 @@ void SendDailyRecap() {
       datetime dealTimeWIB = dealTimeServer + (datetime)offset;
       
       if(dealTimeWIB >= startOfYesterday && dealTimeWIB <= endOfYesterday) {
-         // Hitung Profit
          dailyProfit += HistoryDealGetDouble(ticket, DEAL_PROFIT) + HistoryDealGetDouble(ticket, DEAL_SWAP) + HistoryDealGetDouble(ticket, DEAL_COMMISSION);
          
-         // Cari Max Lot (Hanya Entry, bukan exit)
          if(HistoryDealGetInteger(ticket, DEAL_ENTRY) == DEAL_ENTRY_IN) {
              double vol = HistoryDealGetDouble(ticket, DEAL_VOLUME);
              if(vol > maxLot24h) maxLot24h = vol;
@@ -224,11 +241,9 @@ void SendDailyRecap() {
       }
    }
    
-   // Ambil Data Drawdown Terakhir (Sebelum direset)
    double ddMoney = GlobalVariableGet(GV_DD_Money);
    double ddPerc  = GlobalVariableGet(GV_DD_Perc);
 
-   // 4. KIRIM PESAN DAILY RECAP
    string msg = "##### DAILY RECAP #####\n"
               + "Time : " + TimeToString(startOfYesterday, TIME_DATE) + "\n"
               + "Mode : " + ActiveSymbolName + "\n"
@@ -239,9 +254,6 @@ void SendDailyRecap() {
    SendTelegram(msg);
 }
 
-//+------------------------------------------------------------------+
-//| 6. DASHBOARD & REPORT                                            |
-//+------------------------------------------------------------------+
 void UpdateDashboard() {
    double liveBuyLot = 0, liveSellLot = 0;
    double liveBuyPnL = 0, liveSellPnL = 0;
@@ -265,7 +277,7 @@ void UpdateDashboard() {
    int xBase = 240; 
    color colHead = (ModeTrading == MODE_XAU) ? clrGold : clrOrange; 
    color colText = clrWhite;
-   string titleStr = (ModeTrading == MODE_XAU) ? "EA GOLD v1.2" : "EA BTC v1.2";
+   string titleStr = (ModeTrading == MODE_XAU) ? "EA GOLD v1.3" : "EA BTC v1.3";
    
    CreateLabel("P100_Title", titleStr, xBase+15, 105, colHead, 10, true);
    
@@ -295,7 +307,6 @@ void SendPeriodicReport() {
    double ddPerc  = GlobalVariableGet(GV_DD_Perc);
    string wib = TimeToString(GetWIBTime(), TIME_DATE|TIME_MINUTES) + " WIB";
    
-   // 3. KIRIM PESAN REPORT
    string msg = "##### REPORT #####\n"
               + "Mode : " + ActiveSymbolName + "\n"
               + "Bal: $" + DoubleToString(balance, 2) + "\n"
@@ -304,9 +315,6 @@ void SendPeriodicReport() {
    SendTelegram(msg);
 }
 
-//+------------------------------------------------------------------+
-//| 7. LOGIKA TRADING (STRICT STEP)                                  |
-//+------------------------------------------------------------------+
 void RemoveDuplicateOrders() {
    for(int i=PositionsTotal()-1; i>=0; i--) {
       if(positionInfo.SelectByIndex(i) && positionInfo.Magic() == ActiveMagic) {
@@ -361,7 +369,6 @@ void CheckTakeProfit(int currentLevel) {
       ClosePositions(POSITION_TYPE_BUY); 
       buyLotRefPrice = (double)currentLevel; 
       
-      // 2. KIRIM PESAN TP BUY
       string msg = "##### TP BUY HIT #####\n"
                  + "PAIR : " + ActiveSymbolName + "\n"
                  + "Profit: +$" + DoubleToString(bProfit, 2) + "\n"
@@ -378,7 +385,6 @@ void CheckTakeProfit(int currentLevel) {
       ClosePositions(POSITION_TYPE_SELL); 
       sellLotRefPrice = (double)currentLevel; 
       
-      // 2. KIRIM PESAN TP SELL
       string msg = "##### TP SELL HIT #####\n"
                  + "PAIR : " + ActiveSymbolName + "\n"
                  + "Profit: +$" + DoubleToString(sProfit, 2) + "\n"
@@ -391,9 +397,6 @@ void CheckTakeProfit(int currentLevel) {
    }
 }
 
-//+------------------------------------------------------------------+
-//| 8. HELPERS                                                       |
-//+------------------------------------------------------------------+
 double CalculateLotByCount(ENUM_POSITION_TYPE type) {
     int count = 0;
     for(int i=PositionsTotal()-1; i>=0; i--) {
@@ -403,7 +406,9 @@ double CalculateLotByCount(ENUM_POSITION_TYPE type) {
     }
     int step = count / LevelsPerStep;
     double multiplier = MathPow(2, step);
-    double lot = LotAwal * multiplier;
+    
+    // GUNAKAN SAFELOTAWAL (BUKAN INPUT)
+    double lot = SafeLotAwal * multiplier;
     
     double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
     double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
@@ -422,7 +427,6 @@ void CheckMaxDrawdown() {
       double currentDDMoney = balance - equity;
       double currentDDPerc  = (currentDDMoney / balance) * 100.0;
       double recordDD = GlobalVariableGet(GV_DD_Money);
-      // Rekam DD Tertinggi (akan direset tiap ganti hari)
       if(currentDDMoney > recordDD) {
          GlobalVariableSet(GV_DD_Money, currentDDMoney);
          GlobalVariableSet(GV_DD_Perc, currentDDPerc);
@@ -432,7 +436,6 @@ void CheckMaxDrawdown() {
 
 void InitBase() {
    CloseAllOrders();
-   // Reset tidak perlu kirim telegram lagi agar tidak spam
    lastExecutionTime = TimeCurrent(); lastReportTime = TimeCurrent(); 
 }
 
