@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
-//|                  Project100_v1.3_Final_Fix.mq5                   |
-//|    VERSION: 1.3 | Fix: Constant Input Modification Error         |
+//|                  Project100_Final_v1.0.mq5                       |
+//|   GOLD MASTER: Grid 1.0 + Timer 120m + Full Features             |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.30"
+#property version   "1.0"
 
 #include <Trade\PositionInfo.mqh>
 #include <Trade\Trade.mqh>
@@ -20,26 +20,26 @@ input double TargetProfit     = 100.0;
 input double LotAwal          = 0.01;  
 input int    JedaAntiSpam     = 3;     
 
-// --- SETTINGAN GRID ---
-input double Grid_XAU_Jarak   = 2.0;   
+// --- SETTINGAN GRID (MODIFIED) ---
+input double Grid_XAU_Jarak   = 1.0;   // JARAK DIPERDEKAT JADI 1.0
 input double Grid_BTC_Jarak   = 200.0; 
 
-// --- WAKTU & TELEGRAM ---
-input int    JamMulai_WIB     = 7;     
-input int    JamStop_WIB      = 23;    
-input int    InfoTelegram     = 60;    
+// --- WAKTU & TELEGRAM (MODIFIED) ---
+input int    JamMulai_WIB     = 0;     // Default 24 Jam
+input int    JamStop_WIB      = 24;    // Default 24 Jam
+input int    InfoTelegram     = 120;   // LAPORAN SETIAP 120 MENIT (2 JAM)
 input string TelegramToken    = "8571105656:AAHyTtdXkmQjkDZGZsJcO8_mc9clrafyc_8"; 
 input string TelegramChatID   = "6575521535"; 
 
 // --- SETTINGAN INTERNAL ---
-const int    LevelsPerStep   = 4;      // Strict 4x Entry baru naik lot
+const int    LevelsPerStep   = 4;      
 const int    BaseMagic       = 112233; 
 const bool   InpResetOnStart = false;  
 const bool   UseTimeFilter   = true;   
 
 // --- VARIABEL GLOBAL ---
-string GV_DD_Money = "P100v13_DD_Money"; 
-string GV_DD_Perc  = "P100v13_DD_Perc";
+string GV_DD_Money = "P100v10_DD_Money"; 
+string GV_DD_Perc  = "P100v10_DD_Perc";
 
 double buyLotRefPrice = 0;  
 double sellLotRefPrice = 0;
@@ -52,12 +52,12 @@ int lastDayWIB = -1;
 double ActiveGridGap = 0;
 int    ActiveMagic   = 0;
 string ActiveSymbolName = "";
-double SafeLotAwal = 0.01; // Variabel Penampung Lot (Agar tidak Error)
+double SafeLotAwal = 0.01; 
 
 CPositionInfo positionInfo;
 CTrade trade;
 
-// --- FORWARD DECLARATION (Agar urutan fungsi tidak masalah) ---
+// --- FORWARD DECLARATION ---
 void CheckDailyReset();
 void UpdateDashboard();
 void CheckMaxDrawdown();
@@ -83,7 +83,6 @@ bool IsTradingTime();
 //| 1. FUNGSI INISIALISASI                                           |
 //+------------------------------------------------------------------+
 int OnInit() {
-    // 1. PINDAHKAN NILAI INPUT KE VARIABEL AMAN
     SafeLotAwal = LotAwal; 
 
     if(ModeTrading == MODE_XAU) {
@@ -103,7 +102,6 @@ int OnInit() {
     trade.SetExpertMagicNumber(ActiveMagic);
     trade.SetTypeFillingBySymbol(_Symbol);
     
-    // Safety Lot (Diaplikasikan ke SafeLotAwal, bukan Input)
     double minVol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
     if(SafeLotAwal < minVol) SafeLotAwal = minVol;
 
@@ -114,7 +112,6 @@ int OnInit() {
     needReset = InpResetOnStart;
     lastReportTime = TimeCurrent(); 
 
-    // Init Global Variable
     if(!GlobalVariableCheck(GV_DD_Money)) GlobalVariableSet(GV_DD_Money, 0);
     if(!GlobalVariableCheck(GV_DD_Perc)) GlobalVariableSet(GV_DD_Perc, 0);
 
@@ -124,19 +121,28 @@ int OnInit() {
 
     UpdateDashboard();
     
-    // Kirim Pesan Start
     string wib = TimeToString(GetWIBTime(), TIME_DATE|TIME_MINUTES) + " WIB";
-    string msg = "\\\\\\\\\\\\\\\\\\\\\\\\∆/////////////////////\n"
-               + "EA Project100 v1.3 STARTED\n"
-               + "Mode            : " + ActiveSymbolName + "\n"
+    string msg = "##### > STARTED <#####\n"
+               + "EA Project100 v1.0\n"
+               + "Mode             : " + ActiveSymbolName + "\n"
                + "time : " + wib;
     SendTelegram(msg);
     
     return(INIT_SUCCEEDED);
 }
 
+//+------------------------------------------------------------------+
+//| 2. FUNGSI DEINIT                                                 |
+//+------------------------------------------------------------------+
 void OnDeinit(const int reason) {
    ObjectsDeleteAll(0, "P100_"); 
+   
+   string wib = TimeToString(GetWIBTime(), TIME_DATE|TIME_MINUTES) + " WIB";
+   string msg = "##### > STOPPED <#####\n"
+              + "EA Project100 v1.0\n"
+              + "Mode             : " + ActiveSymbolName + "\n"
+              + "time : " + wib;
+   SendTelegram(msg);
 }
 
 //+------------------------------------------------------------------+
@@ -150,6 +156,8 @@ void OnTick()
    CheckDailyReset();
    UpdateDashboard();
    CheckMaxDrawdown(); 
+   
+   // SAFETY: Hapus Order Duplikat (Strict Logic)
    RemoveDuplicateOrders();
    
    if(TimeCurrent() - lastReportTime >= (InfoTelegram * 60)) {
@@ -176,7 +184,7 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| 4. IMPLEMENTASI FUNGSI                                           |
+//| IMPLEMENTASI FUNGSI                                              |
 //+------------------------------------------------------------------+
 datetime GetWIBTime() {
    return TimeGMT() + (7 * 3600);
@@ -187,6 +195,10 @@ bool IsTradingTime() {
    MqlDateTime dt; 
    TimeToStruct(GetWIBTime(), dt);
    int h = dt.hour;
+   
+   // Logic 24 Jam (0-24)
+   if(JamMulai_WIB == 0 && JamStop_WIB >= 24) return true;
+
    if(JamMulai_WIB < JamStop_WIB) {
       if(h >= JamMulai_WIB && h < JamStop_WIB) return true;
    } else {
@@ -216,7 +228,7 @@ void SendDailyRecap() {
    
    datetime startOfToday = StructToTime(dt);
    datetime startOfYesterday = startOfToday - 86400; 
-   datetime endOfYesterday = startOfToday - 1;       
+   datetime endOfYesterday = startOfToday - 1;        
    
    HistorySelect(0, TimeCurrent()); 
    double dailyProfit = 0;
@@ -274,18 +286,48 @@ void UpdateDashboard() {
       }
    }
    
-   int xBase = 240; 
+   // HITUNG PROFIT HARI INI
+   datetime nowWIB = GetWIBTime();
+   MqlDateTime dt;
+   TimeToStruct(nowWIB, dt);
+   dt.hour=0; dt.min=0; dt.sec=0;
+   datetime startOfTodayWIB = StructToTime(dt); 
+   
+   HistorySelect(0, TimeCurrent());
+   double profitToday = 0;
+   long offset = GetWIBTime() - TimeCurrent(); 
+   
+   for(int i=0; i<HistoryDealsTotal(); i++) {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) == _Symbol && HistoryDealGetInteger(ticket, DEAL_MAGIC) == ActiveMagic) {
+         datetime dealTimeServer = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+         datetime dealTimeWIB = dealTimeServer + (datetime)offset;
+         if(dealTimeWIB >= startOfTodayWIB) {
+             profitToday += HistoryDealGetDouble(ticket, DEAL_PROFIT) + HistoryDealGetDouble(ticket, DEAL_SWAP) + HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+         }
+      }
+   }
+
+   int xBase = 190; 
    color colHead = (ModeTrading == MODE_XAU) ? clrGold : clrOrange; 
    color colText = clrWhite;
-   string titleStr = (ModeTrading == MODE_XAU) ? "EA GOLD v1.3" : "EA BTC v1.3";
+   string titleStr = (ModeTrading == MODE_XAU) ? "EA GOLD v1.0" : "EA BTC v1.0";
    
-   CreateLabel("P100_Title", titleStr, xBase+15, 105, colHead, 10, true);
+   CreateLabel("P100_Title", titleStr, xBase+15, 125, colHead, 10, true);
    
    string sBuy = "Buy (" + IntegerToString(cntBuy) + ") : " + DoubleToString(liveBuyLot, 2) + " L  ($ " + DoubleToString(liveBuyPnL, 2)+")";
-   CreateLabel("P100_Buy", sBuy, xBase+15, 85, (liveBuyLot>0 ? clrLime : colText));
+   CreateLabel("P100_Buy", sBuy, xBase+15, 105, (liveBuyLot>0 ? clrLime : colText));
    
    string sSell = "Sell (" + IntegerToString(cntSell) + ") : " + DoubleToString(liveSellLot, 2) + " L  ($ " + DoubleToString(liveSellPnL, 2)+")";
-   CreateLabel("P100_Sell", sSell, xBase+15, 65, (liveSellLot>0 ? clrRed : colText));
+   CreateLabel("P100_Sell", sSell, xBase+15, 85, (liveSellLot>0 ? clrRed : colText));
+   
+   string sTot = "Total : " + DoubleToString(liveBuyLot+liveSellLot, 2) + " Lot";
+   CreateLabel("P100_Tot", sTot, xBase+15, 65, colText);
+   
+   CreateLabel("P100_Line", "--------------------------", xBase+15, 50, clrGray);
+   
+   string sProf = "TP Today: " + (profitToday>=0?"+$":"-$") + DoubleToString(MathAbs(profitToday), 2);
+   CreateLabel("P100_Prof", sProf, xBase+15, 30, (profitToday>=0 ? clrLime : clrRed), 10, true);
 }
 
 void CreateLabel(string name, string text, int x, int y, color col, int fontSize=9, bool bold=false) {
@@ -319,14 +361,19 @@ void RemoveDuplicateOrders() {
    for(int i=PositionsTotal()-1; i>=0; i--) {
       if(positionInfo.SelectByIndex(i) && positionInfo.Magic() == ActiveMagic) {
          ulong ticketA = positionInfo.Ticket();
-         int levelA = (int)(MathRound(positionInfo.PriceOpen() / ActiveGridGap) * ActiveGridGap);
+         double priceA = positionInfo.PriceOpen();
+         ENUM_POSITION_TYPE typeA = positionInfo.PositionType();
+         
          for(int j=0; j<PositionsTotal(); j++) {
             if(i == j) continue; 
             if(positionInfo.SelectByIndex(j) && positionInfo.Magic() == ActiveMagic) {
-               if(positionInfo.PositionType() == positionInfo.PositionType() && 
-                  levelA == (int)(MathRound(positionInfo.PriceOpen()/ActiveGridGap)*ActiveGridGap) && 
-                  ticketA > positionInfo.Ticket()) {
-                  trade.PositionClose(ticketA); return; 
+               // HAPUS HANYA JIKA HARGA BENAR-BENAR SAMA PERSIS (Toleransi 0.1)
+               if(positionInfo.PositionType() == typeA && ticketA > positionInfo.Ticket()) {
+                  if(MathAbs(priceA - positionInfo.PriceOpen()) < 0.1) {
+                      trade.PositionClose(ticketA); 
+                      Print("⚠️ DUPLICATE REMOVED: Ticket " + (string)ticketA);
+                      return; 
+                  }
                }
             }
          }
@@ -365,6 +412,7 @@ void CheckTakeProfit(int currentLevel) {
    double ddPerc  = GlobalVariableGet(GV_DD_Perc);
    
    double bProfit = CalculateProfit(POSITION_TYPE_BUY);
+   
    if(bProfit >= TargetProfit) { 
       ClosePositions(POSITION_TYPE_BUY); 
       buyLotRefPrice = (double)currentLevel; 
@@ -376,11 +424,11 @@ void CheckTakeProfit(int currentLevel) {
                  + "Drawdown : $" + DoubleToString(ddMoney, 2) + " ("+DoubleToString(ddPerc, 1)+"%)\n"
                  + "time: " + wib;
       SendTelegram(msg);
-      
       lastExecutionTime=TimeCurrent(); 
    }
    
    double sProfit = CalculateProfit(POSITION_TYPE_SELL);
+   
    if(sProfit >= TargetProfit) { 
       ClosePositions(POSITION_TYPE_SELL); 
       sellLotRefPrice = (double)currentLevel; 
@@ -392,7 +440,6 @@ void CheckTakeProfit(int currentLevel) {
                  + "Drawdown : $" + DoubleToString(ddMoney, 2) + " ("+DoubleToString(ddPerc, 1)+"%)\n"
                  + "time: " + wib;
       SendTelegram(msg);
-      
       lastExecutionTime=TimeCurrent(); 
    }
 }
@@ -407,7 +454,6 @@ double CalculateLotByCount(ENUM_POSITION_TYPE type) {
     int step = count / LevelsPerStep;
     double multiplier = MathPow(2, step);
     
-    // GUNAKAN SAFELOTAWAL (BUKAN INPUT)
     double lot = SafeLotAwal * multiplier;
     
     double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
