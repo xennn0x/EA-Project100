@@ -1,0 +1,396 @@
+//+------------------------------------------------------------------+
+//|                                       Project100_Final_Cent.mq5 |
+//|                                  Optimized for Cent Accounts     |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.4"
+
+#include <Trade\PositionInfo.mqh>
+#include <Trade\Trade.mqh>
+
+// --- ENUM UNTUK PILIHAN MODE ---
+enum ENUM_TRADING_MODE {
+   MODE_XAU = 0, // XAUUSD (Gold)
+   MODE_BTC = 1  // BTCUSD (Bitcoin)
+};
+
+// --- INPUT PARAMETERS ---
+input ENUM_TRADING_MODE ModeTrading = MODE_XAU; 
+input double TargetProfit     = 100.0;  // Dalam Cent
+input double LotAwal          = 0.01;  
+input int    JedaAntiSpam     = 3;     
+input int    MaxSpread        = 60;     
+
+// --- SETTINGAN GRID ---
+input double Grid_XAU_Jarak   = 2.0;   
+input double Grid_BTC_Jarak   = 200.0; 
+
+// --- WAKTU & TELEGRAM ---
+input int    JamMulai_WIB     = 7;     
+input int    JamStop_WIB      = 23;    
+input int    InfoTelegram     = 60;    
+input string TelegramToken    = "8571105656:AAHyTtdXkmQjkDZGZsJcO8_mc9clrafyc_8"; 
+input string TelegramChatID   = "6575521535"; 
+
+// --- SETTINGAN INTERNAL ---
+const int    LevelsPerStep   = 4;      
+const int    BaseMagic       = 112233; 
+const bool   UseTimeFilter   = true;   
+
+// --- VARIABEL GLOBAL ---
+string GV_DD_Money = "P100v13_DD_Money"; 
+string GV_DD_Perc  = "P100v13_DD_Perc";
+
+double buyLotRefPrice = 0;  
+double sellLotRefPrice = 0;
+datetime lastExecutionTime = 0; 
+datetime lastReportTime = 0; 
+int lastDayWIB = -1; 
+bool isClosingProcess = false; 
+
+double ActiveGridGap = 0;
+int    ActiveMagic   = 0;
+string ActiveSymbolName = "";
+double SafeLotAwal = 0.01; 
+
+CPositionInfo positionInfo;
+CTrade trade;
+
+// --- FORWARD DECLARATION ---
+void CheckDailyReset();
+void UpdateDashboard();
+void CheckMaxDrawdown();
+void SendPeriodicReport();
+void ManageGrid(int level);
+void CheckTakeProfit(int currentLevel);
+bool OpenOrder(ENUM_ORDER_TYPE type, int level, double lot);
+void ClosePositions(ENUM_POSITION_TYPE type);
+double GetTotalLots(ENUM_POSITION_TYPE type);
+bool IsOrderExistsById(int level, ENUM_POSITION_TYPE type);
+double CalculateProfit(ENUM_POSITION_TYPE type);
+double CalculateLotByCount(ENUM_POSITION_TYPE type);
+void SendDailyRecap();
+void SendTelegram(string m);
+void CreateLabel(string name, string text, int x, int y, color col, int fontSize=9, bool bold=false);
+datetime GetWIBTime();
+bool IsTradingTime();
+
+//+------------------------------------------------------------------+
+//| 1. FUNGSI INISIALISASI                                           |
+//+------------------------------------------------------------------+
+int OnInit() {
+    SafeLotAwal = LotAwal; 
+
+    if(ModeTrading == MODE_XAU) {
+       ActiveGridGap    = Grid_XAU_Jarak;
+       ActiveMagic      = BaseMagic + 1; 
+       ActiveSymbolName = "XAUUSD";
+    } else {
+       ActiveGridGap    = Grid_BTC_Jarak;
+       ActiveMagic      = BaseMagic + 2; 
+       ActiveSymbolName = "BTCUSD";
+    }
+
+    trade.SetExpertMagicNumber(ActiveMagic);
+    trade.SetTypeFillingBySymbol(_Symbol);
+    trade.SetDeviationInPoints(100); 
+
+    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    buyLotRefPrice = price;
+    sellLotRefPrice = price;
+    lastReportTime = TimeCurrent(); 
+
+    if(!GlobalVariableCheck(GV_DD_Money)) GlobalVariableSet(GV_DD_Money, 0);
+    if(!GlobalVariableCheck(GV_DD_Perc)) GlobalVariableSet(GV_DD_Perc, 0);
+
+    MqlDateTime dt;
+    TimeToStruct(GetWIBTime(), dt);
+    lastDayWIB = dt.day;
+
+    UpdateDashboard();
+    
+    string wib = TimeToString(GetWIBTime(), TIME_DATE|TIME_MINUTES) + " WIB";
+    string msg = "##### > STARTED < #####\n"
+               + "EA Project100 v1.4\n"
+               + "Mode              : " + ActiveSymbolName + "\n"
+               + "Time : " + wib;
+    SendTelegram(msg);
+    
+    return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int reason) {
+   ObjectsDeleteAll(0, "P100_"); 
+   string wib = TimeToString(GetWIBTime(), TIME_DATE|TIME_MINUTES) + " WIB";
+   string msg = "##### > STOPPED < #####\n"
+              + "EA Project100 v1.4\n"
+              + "Mode              : " + ActiveSymbolName + "\n"
+              + "Time : " + wib;
+   SendTelegram(msg);
+}
+
+//+------------------------------------------------------------------+
+//| 2. FUNGSI UTAMA (ONTICK)                                         |
+//+------------------------------------------------------------------+
+void OnTick() {
+   if(isClosingProcess) return; 
+
+   CheckDailyReset();
+   UpdateDashboard();
+   CheckMaxDrawdown(); 
+   
+   if(TimeCurrent() - lastReportTime >= (InfoTelegram * 60)) {
+      SendPeriodicReport();
+      lastReportTime = TimeCurrent();
+   }
+
+   double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   int currentLevel = (int)(MathRound(currentBid / ActiveGridGap) * ActiveGridGap); 
+
+   if(currentLevel <= 0) return;
+
+   CheckTakeProfit(currentLevel);
+
+   if(TimeCurrent() >= lastExecutionTime + JedaAntiSpam) {
+      ManageGrid(currentLevel);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| 3. FUNGSI TAKE PROFIT (FORMAT ASLI)                              |
+//+------------------------------------------------------------------+
+void CheckTakeProfit(int currentLevel) {
+   if(isClosingProcess) return;
+   
+   string wib = TimeToString(GetWIBTime(), TIME_DATE|TIME_MINUTES) + " WIB";
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double ddMoney = GlobalVariableGet(GV_DD_Money);
+   double ddPerc  = GlobalVariableGet(GV_DD_Perc);
+
+   // CEK PROFIT BUY
+   double bProfit = CalculateProfit(POSITION_TYPE_BUY);
+   if(bProfit >= TargetProfit) {
+      isClosingProcess = true; 
+      
+      string msg = "##### TP BUY HIT #####\n"
+                 + "PAIR : " + ActiveSymbolName + "\n"
+                 + "Profit: +$" + DoubleToString(bProfit, 2) + "\n"
+                 + "Balance : $" + DoubleToString(balance, 2) + "\n"
+                 + "Drawdown : $" + DoubleToString(ddMoney, 2) + " ("+DoubleToString(ddPerc, 1)+"%)\n"
+                 + "time: " + wib;
+      SendTelegram(msg);
+      
+      ClosePositions(POSITION_TYPE_BUY);
+      buyLotRefPrice = (double)currentLevel;
+      lastExecutionTime = TimeCurrent();
+      isClosingProcess = false; 
+   }
+   
+   // CEK PROFIT SELL
+   double sProfit = CalculateProfit(POSITION_TYPE_SELL);
+   if(sProfit >= TargetProfit) {
+      isClosingProcess = true; 
+
+      string msg = "##### TP SELL HIT #####\n"
+                 + "PAIR : " + ActiveSymbolName + "\n"
+                 + "Profit: +$" + DoubleToString(sProfit, 2) + "\n"
+                 + "Balance : $" + DoubleToString(balance, 2) + "\n"
+                 + "Drawdown : $" + DoubleToString(ddMoney, 2) + " ("+DoubleToString(ddPerc, 1)+"%)\n"
+                 + "time: " + wib;
+      SendTelegram(msg);
+
+      ClosePositions(POSITION_TYPE_SELL);
+      sellLotRefPrice = (double)currentLevel;
+      lastExecutionTime = TimeCurrent();
+      isClosingProcess = false; 
+   }
+}
+
+//+------------------------------------------------------------------+
+//| 4. FUNGSI LAPORAN BERKALA (FORMAT ASLI)                          |
+//+------------------------------------------------------------------+
+void SendPeriodicReport() {
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double ddMoney = GlobalVariableGet(GV_DD_Money);
+   double ddPerc  = GlobalVariableGet(GV_DD_Perc);
+   string wib = TimeToString(GetWIBTime(), TIME_DATE|TIME_MINUTES) + " WIB";
+   
+   string msg = "##### REPORT #####\n"
+              + "Mode : " + ActiveSymbolName + "\n"
+              + "Bal: $" + DoubleToString(balance, 2) + "\n"
+              + "Drawdown : $" + DoubleToString(ddMoney, 2) + " ("+DoubleToString(ddPerc, 1)+"%)\n"
+              + "Time: " + wib;
+   SendTelegram(msg);
+}
+
+//+------------------------------------------------------------------+
+//| 5. REKAP HARIAN (FORMAT ASLI)                                    |
+//+------------------------------------------------------------------+
+void SendDailyRecap() {
+   datetime nowWIB = GetWIBTime();
+   MqlDateTime dt;
+   TimeToStruct(nowWIB, dt);
+   dt.hour = 0; dt.min = 0; dt.sec = 0;
+   
+   datetime startOfToday = StructToTime(dt);
+   datetime startOfYesterday = startOfToday - 86400; 
+   datetime endOfYesterday = startOfToday - 1;        
+   
+   HistorySelect(startOfYesterday, TimeCurrent()); 
+   double dailyProfit = 0;
+   double maxLot24h = 0; 
+   
+   for(int i=0; i<HistoryDealsTotal(); i++) {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
+      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != ActiveMagic) continue;
+      
+      dailyProfit += HistoryDealGetDouble(ticket, DEAL_PROFIT) + HistoryDealGetDouble(ticket, DEAL_SWAP) + HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+      if(HistoryDealGetInteger(ticket, DEAL_ENTRY) == DEAL_ENTRY_IN) {
+          double vol = HistoryDealGetDouble(ticket, DEAL_VOLUME);
+          if(vol > maxLot24h) maxLot24h = vol;
+      }
+   }
+   
+   double ddMoney = GlobalVariableGet(GV_DD_Money);
+   double ddPerc  = GlobalVariableGet(GV_DD_Perc);
+
+   string msg = "##### DAILY RECAP #####\n"
+              + "Time : " + TimeToString(startOfYesterday, TIME_DATE) + "\n"
+              + "Mode : " + ActiveSymbolName + "\n"
+              + "Profit : " + (dailyProfit>=0?"+$":"-$") + DoubleToString(MathAbs(dailyProfit), 2) + "\n"
+              + "Drawdown 24h : $" + DoubleToString(ddMoney, 2) + " ("+DoubleToString(ddPerc, 1)+"%)\n"
+              + "Max lot 24h : " + DoubleToString(maxLot24h, 2);
+              
+   SendTelegram(msg);
+}
+
+// --- FUNGSI OPEN & CLOSE ---
+
+bool OpenOrder(ENUM_ORDER_TYPE type, int level, double lot) {
+   int spr = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   if(spr > MaxSpread) return false;
+
+   double price = (type == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   return trade.PositionOpen(_Symbol, type, lot, price, 0, 0, "L:"+(string)level);
+}
+
+void ClosePositions(ENUM_POSITION_TYPE type) {
+   int retry = 0;
+   while(GetTotalLots(type) > 0 && retry < 10) { 
+      for(int i=PositionsTotal()-1; i>=0; i--) {
+         if(positionInfo.SelectByIndex(i) && positionInfo.Magic()==ActiveMagic && positionInfo.PositionType()==type) {
+            trade.PositionClose(positionInfo.Ticket());
+         }
+      }
+      Sleep(500); 
+      retry++;
+   }
+}
+
+// --- FUNGSI LOGIKA GRID ---
+
+void ManageGrid(int level) {
+   bool isTime = IsTradingTime(); 
+   if(!IsOrderExistsById(level, POSITION_TYPE_BUY)) {
+      if(isTime || GetTotalLots(POSITION_TYPE_BUY) > 0) {
+         double nextLot = CalculateLotByCount(POSITION_TYPE_BUY);
+         if(OpenOrder(ORDER_TYPE_BUY, level, nextLot)) lastExecutionTime = TimeCurrent();
+      }
+   }
+   if(!IsOrderExistsById(level, POSITION_TYPE_SELL)) {
+      if(isTime || GetTotalLots(POSITION_TYPE_SELL) > 0) {
+         double nextLot = CalculateLotByCount(POSITION_TYPE_SELL);
+         if(OpenOrder(ORDER_TYPE_SELL, level, nextLot)) lastExecutionTime = TimeCurrent();
+      }
+   }
+}
+
+double CalculateLotByCount(ENUM_POSITION_TYPE type) {
+    int count = 0;
+    for(int i=PositionsTotal()-1; i>=0; i--) {
+        if(positionInfo.SelectByIndex(i) && positionInfo.Magic() == ActiveMagic && positionInfo.PositionType() == type) count++;
+    }
+    double multiplier = MathPow(2, (count / LevelsPerStep));
+    double lot = SafeLotAwal * multiplier;
+    double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    return MathFloor(lot / stepLot) * stepLot;
+}
+
+double CalculateProfit(ENUM_POSITION_TYPE type) {
+   double p=0;
+   for(int i=PositionsTotal()-1; i>=0; i--) {
+      if(positionInfo.SelectByIndex(i) && positionInfo.Magic()==ActiveMagic && positionInfo.PositionType()==type)
+         p += positionInfo.Profit() + positionInfo.Commission() + positionInfo.Swap();
+   }
+   return p;
+}
+
+bool IsOrderExistsById(int level, ENUM_POSITION_TYPE type) {
+   string c="L:"+(string)level;
+   for(int i=PositionsTotal()-1; i>=0; i--) {
+      if(positionInfo.SelectByIndex(i) && positionInfo.Magic()==ActiveMagic && positionInfo.PositionType()==type) {
+         if(StringFind(positionInfo.Comment(), c)>=0 || MathAbs(positionInfo.PriceOpen()-(double)level)<(ActiveGridGap/2.0)) return true;
+      }
+   }
+   return false;
+}
+
+double GetTotalLots(ENUM_POSITION_TYPE type) {
+   double t=0;
+   for(int i=PositionsTotal()-1; i>=0; i--) {
+      if(positionInfo.SelectByIndex(i) && positionInfo.Magic()==ActiveMagic && positionInfo.PositionType()==type) t+=positionInfo.Volume();
+   }
+   return t;
+}
+
+datetime GetWIBTime() { return TimeGMT() + (7 * 3600); }
+
+bool IsTradingTime() {
+   if(!UseTimeFilter) return true; 
+   MqlDateTime dt; TimeToStruct(GetWIBTime(), dt);
+   int h = dt.hour;
+   return (JamMulai_WIB < JamStop_WIB) ? (h >= JamMulai_WIB && h < JamStop_WIB) : (h >= JamMulai_WIB || h < JamStop_WIB);
+}
+
+void CheckDailyReset() {
+   MqlDateTime dt; TimeToStruct(GetWIBTime(), dt);
+   if(lastDayWIB != -1 && dt.day != lastDayWIB) {
+      SendDailyRecap(); 
+      GlobalVariableSet(GV_DD_Money, 0); GlobalVariableSet(GV_DD_Perc, 0);
+      lastDayWIB = dt.day; UpdateDashboard(); 
+   }
+}
+
+void CheckMaxDrawdown() {
+   double bal = AccountInfoDouble(ACCOUNT_BALANCE), eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(eq < bal) {
+      double ddm = bal - eq;
+      if(ddm > GlobalVariableGet(GV_DD_Money)) {
+         GlobalVariableSet(GV_DD_Money, ddm);
+         GlobalVariableSet(GV_DD_Perc, (ddm/bal)*100.0);
+      }
+   }
+}
+
+void UpdateDashboard() {
+   int xBase = 190;
+   color colHead = (ModeTrading == MODE_XAU) ? clrGold : clrOrange;
+   CreateLabel("P100_Title", (ModeTrading == MODE_XAU ? "EA GOLD v1.4" : "EA BTC v1.4"), xBase+15, 105, colHead, 10, true);
+}
+
+void CreateLabel(string name, string text, int x, int y, color col, int fontSize=9, bool bold=false) {
+   if(ObjectFind(0, name) < 0) {
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_RIGHT_LOWER);
+      ObjectSetString(0, name, OBJPROP_FONT, "Consolas");
+   }
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x); ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetString(0, name, OBJPROP_TEXT, text); ObjectSetInteger(0, name, OBJPROP_COLOR, col);
+}
+
+void SendTelegram(string m) {
+   char d[]; StringToCharArray("chat_id="+TelegramChatID+"&text="+m, d);
+   uchar r[]; string h="Content-Type: application/x-www-form-urlencoded", res;
+   WebRequest("POST", "https://api.telegram.org/bot"+TelegramToken+"/sendMessage", h, 3000, d, r, res);
+}
